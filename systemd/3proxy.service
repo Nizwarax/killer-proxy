@@ -1,0 +1,12 @@
+[Unit]
+Description=KILLER PROXY 3proxy Engine
+After=network.target
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/3proxy /etc/3proxy/3proxy.cfg
+Restart=always
+RestartSec=5
+LimitNOFILE=1048576
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,144 @@
+#!/usr/bin/env python3
+"""
+proxy-user: manage SOCKS5/HTTP proxy users with expiry.
+  proxy-user add <user> <pass> <days>
+  proxy-user del <user>
+  proxy-user extend <user> <days>
+  proxy-user list | stats | check
+"""
+import sys, os, json, subprocess
+from datetime import datetime, timezone, timedelta
+
+USERS_JSON = "/etc/3proxy/users.json"
+GEN = "/usr/local/bin/generate-proxies.py"
+
+def load():
+    if not os.path.exists(USERS_JSON):
+        return {"version": "1.0", "mode": "multi-user", "users": {}}
+    try:
+        with open(USERS_JSON) as f:
+            return json.load(f)
+    except Exception:
+        return {"version": "1.0", "mode": "multi-user", "users": {}}
+
+def save(data):
+    os.makedirs(os.path.dirname(USERS_JSON), exist_ok=True)
+    tmp = USERS_JSON + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, USERS_JSON)
+    os.chmod(USERS_JSON, 0o600)
+
+def regen():
+    subprocess.run([GEN], check=True)
+
+def warp_count():
+    if os.path.isdir("/etc/wireproxy"):
+        try:
+            return len([d for d in os.listdir("/etc/wireproxy") if d.startswith("warp")])
+        except Exception:
+            pass
+    return 4
+
+def add(user, password, days):
+    data = load(); users = data.setdefault("users", {})
+    now = datetime.now(timezone.utc); exp = now + timedelta(days=int(days))
+    if user in users:
+        users[user]["password"] = password
+        users[user]["expires_at"] = exp.strftime("%Y-%m-%dT%H:%M:%SZ")
+        users[user]["duration_days"] = int(days)
+        users[user]["status"] = "active"
+    else:
+        used = {v.get("socks_port") for v in users.values() if v.get("socks_port")}
+        p = 10002
+        while p in used: p += 1
+        wc = warp_count()
+        wi = (sum(1 for v in users.values() if v.get("warp_instance")) % wc) + 1
+        users[user] = {"username": user, "password": password,
+                       "socks_port": p, "http_port": p + 1000, "warp_instance": wi,
+                       "created_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                       "expires_at": exp.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                       "duration_days": int(days), "status": "active"}
+    save(data); regen()
+    print(f"[OK] proxy user '{user}' added/updated ({days}d). SOCKS5: 10001.. -> port {users[user].get('socks_port')}")
+
+def delete(user):
+    data = load(); users = data.get("users", {})
+    if user not in users:
+        print(f"[ERR] user '{user}' not found"); sys.exit(1)
+    del users[user]; save(data); regen()
+    print(f"[OK] user '{user}' deleted")
+
+def extend(user, days):
+    data = load(); users = data.get("users", {})
+    if user not in users:
+        print(f"[ERR] user '{user}' not found"); sys.exit(1)
+    now = datetime.now(timezone.utc)
+    try:
+        cur = datetime.fromisoformat(users[user]["expires_at"].replace("Z", "+00:00"))
+    except Exception:
+        cur = now
+    base = max(now, cur)
+    new = base + timedelta(days=int(days))
+    users[user]["expires_at"] = new.strftime("%Y-%m-%dT%H:%M:%SZ")
+    users[user]["duration_days"] = users[user].get("duration_days", 0) + int(days)
+    users[user]["status"] = "active"
+    save(data); regen()
+    print(f"[OK] '{user}' extended {days}d -> expires {new.strftime('%Y-%m-%d')}")
+
+def check():
+    """Mark expired users; only regenerate if something changed."""
+    data = load(); users = data.get("users", {}); now = datetime.now(timezone.utc)
+    changed = False
+    for u, info in users.items():
+        try:
+            exp = datetime.fromisoformat(info["expires_at"].replace("Z", "+00:00"))
+        except Exception:
+            continue
+        if exp <= now and info.get("status") != "expired":
+            info["status"] = "expired"; changed = True
+            print(f"[EXPIRE] {u} expired")
+    if changed:
+        save(data); regen()
+        print("[OK] config regenerated for expired users")
+    else:
+        print("[OK] no newly expired users (no restart)")
+
+def list_users():
+    data = load(); users = data.get("users", {}); now = datetime.now(timezone.utc)
+    if not users:
+        print("No users yet. Use: proxy-user add <user> <pass> <days>"); return
+    print(f"{'USER':<14}{'STATUS':<9}{'EXPIRES':<12}{'DAYS':<6}{'SOCKS':<8}{'HTTP':<8}{'WARP'}")
+    print("-" * 66)
+    for u, info in sorted(users.items(), key=lambda x: x[1].get("socks_port", 9999)):
+        try:
+            d = (datetime.fromisoformat(info["expires_at"].replace("Z", "+00:00")) - now).days
+        except Exception:
+            d = 0
+        st = "EXPIRED" if (d < 0 or info.get("status") == "expired") else ("WARN" if d <= 3 else "ACTIVE")
+        print(f"{u:<14}{st:<9}{info.get('expires_at','')[:10]:<12}{d:<6}{info.get('socks_port'):<8}{info.get('http_port'):<8}#{info.get('warp_instance')}")
+
+def stats():
+    data = load(); users = data.get("users", {}); now = datetime.now(timezone.utc)
+    act = 0
+    for info in users.values():
+        try:
+            if (datetime.fromisoformat(info["expires_at"].replace("Z", "+00:00")) - now).days >= 0 and info.get("status") == "active":
+                act += 1
+        except Exception:
+            pass
+    print(f"Total users: {len(users)} | Active: {act} | Expired: {len(users) - act}")
+
+def usage():
+    print("""Usage: proxy-user <add <user> <pass> <days>> | del <user> | extend <user> <days> | list | stats | check""")
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2: usage(); sys.exit(1)
+    c = sys.argv[1].lower()
+    if c == "add" and len(sys.argv) == 5: add(sys.argv[2], sys.argv[3], sys.argv[4])
+    elif c in ("del", "delete") and len(sys.argv) == 3: delete(sys.argv[2])
+    elif c == "extend" and len(sys.argv) == 4: extend(sys.argv[2], sys.argv[3])
+    elif c == "list": list_users()
+    elif c == "stats": stats()
+    elif c == "check": check()
+    else: usage(); sys.exit(1)

@@ -1,0 +1,178 @@
+#!/bin/bash
+# KILLER PROXY - interactive dashboard (aliased as `proxy` and `menu`)
+set -u
+PINK='\033[1;35m'; CYAN='\033[1;36m'; GREEN='\033[1;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; BLUE='\033[0;34m'; WHITE='\033[1;37m'; NC='\033[0m'
+TITLE="KILLER PROXY PANEL v3.0"
+
+get_ip(){ curl -s4 --max-time 3 ipinfo.io/ip 2>/dev/null || curl -s4 --max-time 3 icanhazip.com 2>/dev/null || hostname -I | awk '{print $1}'; }
+get_isp(){ curl -s --max-time 3 ipinfo.io/org 2>/dev/null | cut -c1-25 || echo "Unknown ISP"; }
+get_lat(){ ping -c1 -W1 1.1.1.1 2>/dev/null | grep -oE 'time=[0-9.]+' | cut -d= -f2 | head -n1 | xargs -I{} echo "{} ms" || echo "N/A"; }
+st(){ systemctl is-active "$1" 2>/dev/null; }
+
+header(){
+  clear
+  local IP ISP LAT XST PST WC UU
+  IP=$(get_ip); ISP=$(get_isp); LAT=$(get_lat)
+  XST=$(st xray); PST=$(st 3proxy)
+  WC=$(ls -d /etc/wireproxy/warp* 2>/dev/null | wc -l)
+  UU=$(jq -r '.users | length' /etc/3proxy/users.json 2>/dev/null || echo 0)
+  echo -e "${PINK}╔════════════════════════════════════════════════════════════════════╗${NC}"
+  echo -e "${PINK}║${NC}   ${CYAN}${TITLE}${NC}   ${PINK}║${NC}"
+  echo -e "${PINK}╠════════════════════════════════════════════════════════════════════╣${NC}"
+  echo -e "${PINK}║${NC} IP      : ${WHITE}$IP${NC}"
+  echo -e "${PINK}║${NC} ISP     : ${BLUE}$ISP${NC}"
+  echo -e "${PINK}║${NC} LATENCY : ${YELLOW}$LAT${NC}"
+  echo -e "${PINK}║${NC} XRAY: $([[ "$XST" == "active" ]] && echo -e "${GREEN}ON${NC}" || echo -e "${RED}OFF${NC}")   3PROXY: $([[ "$PST" == "active" ]] && echo -e "${GREEN}ON${NC}" || echo -e "${RED}OFF${NC}")   WARP: ${GREEN}$WC${NC}   PROXY-USERS: ${GREEN}$UU${NC}"
+  echo -e "${PINK}╚════════════════════════════════════════════════════════════════════╝${NC}"
+  echo ""
+}
+
+diag(){
+  echo -e "${CYAN}=== STATUS LAYANAN ===${NC}"
+  systemctl is-active xray 2>/dev/null | grep -q active && echo -e "  ${GREEN}OK${NC}  xray" || echo -e "  ${RED}OFF${NC}  xray"
+  systemctl is-active 3proxy 2>/dev/null | grep -q active && echo -e "  ${GREEN}OK${NC}  3proxy" || echo -e "  ${RED}OFF${NC}  3proxy"
+  echo -e "${CYAN}=== WARP INSTANCES ===${NC}"
+  for d in /etc/wireproxy/warp*; do
+    [ -d "$d" ] || continue
+    n=$(basename "$d")
+    systemctl is-active "wireproxy@$n" 2>/dev/null | grep -q active && echo -e "  ${GREEN}UP${NC}   $n" || echo -e "  ${RED}DOWN${NC} $n"
+  done
+  echo -e "${CYAN}=== UJI PORT PROXY ===${NC}"
+  local kind ip port user pass scheme total=0 live=0
+  while read -r kind ip port user pass; do
+    [[ -z "$port" ]] && continue
+    total=$((total+1)); scheme="http"; [[ "$kind" == "SOCKS5:" ]] && scheme="socks5h"
+    if timeout 8 curl -x "$scheme://$user:$pass@$ip:$port" -s --max-time 6 ifconfig.me >/dev/null 2>&1; then
+      live=$((live+1)); echo -e "  ${GREEN}LIVE${NC}  $ip:$port ($scheme)"
+    else
+      echo -e "  ${RED}DEAD${NC}  $ip:$port ($scheme)"
+    fi
+  done < <(grep -E '^  (SOCKS5|HTTP):' /root/daftar_proxy.txt 2>/dev/null | sed 's/^  //; s/: / /')
+  echo -e "  Hasil: ${GREEN}$live/${total}${NC} port live"
+}
+
+traffic(){
+  local out; out=$(timeout 6 /usr/local/bin/xray api statsquery --server=127.0.0.1:10085 2>/dev/null)
+  [[ -z "$out" ]] && { echo -e "${YELLOW}Xray API tidak merespon${NC}"; return; }
+  echo "$out" | python3 -c '
+import json,sys
+from collections import defaultdict
+try: d=json.load(sys.stdin)
+except Exception: print("parse fail"); sys.exit(0)
+stats=d.get("stat", d if isinstance(d,list) else [])
+up=defaultdict(int); down=defaultdict(int); tu=td=0
+for s in stats:
+    n=s.get("name",""); v=s.get("value",0) or 0
+    if ">>>traffic>>>" not in n: continue
+    seg=n.split(">>>"); direction=seg[-1]
+    email=seg[-2] if len(seg)>=5 else "total"
+    if direction=="uplink": up[email]+=v; tu+=v
+    elif direction=="downlink": down[email]+=v; td+=v
+def h(b):
+    for u in ["B","KB","MB","GB","TB"]:
+        if b<1024: return f"{b:.1f} {u}"
+        b/=1024
+    return f"{b:.1f} PB"
+print("=== TRAFFIC VLESS (Xray API) ===")
+print(f"TOTAL   : up {h(tu)} | down {h(td)}")
+for e in sorted(set(up)|set(down)):
+    print(f"  {e:<14}: up {h(up[e])} | down {h(down[e])}")
+'
+}
+
+export_bundle(){
+  local out="/root/KILLER-PROXY-BUNDLE.txt"
+  { echo "=== KILLER PROXY BUNDLE ==="; echo "Dibuat: $(date -u '+%Y-%m-%d %H:%M UTC')"; echo "IP: $(get_ip)";
+    echo; echo "--- VLESS ---"; cat /root/vless_accounts.txt 2>/dev/null; echo;
+    echo "--- PROXY ---"; cat /root/daftar_proxy.txt 2>/dev/null; } > "$out"
+  chmod 600 "$out"; echo -e "${GREEN}BUNDLE: $out${NC}"
+}
+
+setup_bot(){
+  read -p "Bot Token Telegram: " tok; read -p "Chat ID admin (kosongkan = auto dari /start): " cid
+  [[ -n "$tok" ]] || { echo -e "${RED}Token kosong${NC}"; return; }
+  cat > /etc/3proxy/telegram_bot.conf <<EOF
+BOT_TOKEN="$tok"
+ADMIN_ID="$cid"
+EOF
+  chmod 600 /etc/3proxy/telegram_bot.conf
+  systemctl restart proxy-bot 2>/dev/null || echo -e "${YELLOW}Bot gagal start (cek token)${NC}"
+  echo -e "${GREEN}Bot dikonfigurasi${NC}"
+}
+
+scale_ports(){
+  read -p "Total WARP (sekarang $(ls -d /etc/wireproxy/warp* 2>/dev/null | wc -l)): " tot
+  [[ "$tot" =~ ^[0-9]+$ && "$tot" -ge 1 ]] || { echo -e "${RED}Input salah${NC}"; return; }
+  local cur; cur=$(ls -d /etc/wireproxy/warp* 2>/dev/null | wc -l)
+  for i in $(seq $((cur+1)) "$tot"); do
+    mkdir -p "/etc/wireproxy/warp$i"
+    systemctl enable "wireproxy@warp$i" >/dev/null 2>&1
+    systemctl restart "wireproxy@warp$i" 2>/dev/null
+  done
+  /usr/local/bin/generate-proxies.py
+  echo -e "${GREEN}Diskalakan ke $tot WARP. Tambah user via: proxy-user add ...${NC}"
+}
+
+reset_all(){
+  read -p "Reset proxies (stop + hapus config)? [y/N]: " -n 1 -r; echo
+  [[ "$REPLY" =~ ^[Yy]$ ]] || { echo -e "${GREEN}Dibatalkan${NC}"; return; }
+  systemctl stop 3proxy proxy-bot >/dev/null 2>&1
+  for i in $(seq 1 12); do systemctl stop "wireproxy@warp$i" >/dev/null 2>&1; done
+  rm -f /etc/3proxy/3proxy.cfg /etc/3proxy/users.json /etc/3proxy/telegram_bot.conf /root/daftar_proxy.txt
+  echo -e "${GREEN}Proxies direset. Install ulang: install.sh${NC}"
+}
+
+uninstall_all(){
+  read -p "Uninstall TOTAL? ketik YES: " yy
+  [[ "$yy" == "YES" ]] || { echo -e "${GREEN}Dibatalkan${NC}"; return; }
+  systemctl stop xray 3proxy proxy-bot >/dev/null 2>&1
+  for i in $(seq 1 12); do systemctl stop "wireproxy@warp$i" >/dev/null 2>&1; done
+  bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ remove --purge >/dev/null 2>&1
+  rm -rf /etc/3proxy /etc/xray /etc/wireproxy /usr/local/bin/proxy-* /usr/local/bin/menu /usr/local/bin/proxy /usr/local/bin/rotate-warp.sh /usr/local/bin/wgcf /usr/local/bin/wireproxy /usr/local/bin/3proxy
+  rm -f /etc/systemd/system/3proxy.service /etc/systemd/system/wireproxy@.service /etc/systemd/system/proxy-bot.service /etc/cron.d/proxy-expiry /etc/sysctl.d/99-killerproxy.conf /root/daftar_proxy.txt /root/vless_accounts.txt
+  systemctl daemon-reload
+  sed -i '/proxy-rotate/d;/alias menu=/d;/alias proxy=/d' /root/.bashrc 2>/dev/null
+  echo -e "${GREEN}Uninstall selesai${NC}"
+  exit 0
+}
+
+menu(){
+  while true; do
+    header
+    echo -e "${PINK}┌────────────────── ${WHITE}MENU${PINK} ──────────────────┐${NC}"
+    echo -e "${PINK}│${NC} ${GREEN}1.${NC}  Lihat VLESS + Proxy List (QR)        ${PINK}│${NC}"
+    echo -e "${PINK}│${NC} ${GREEN}2.${NC}  Diagnostik Kesehatan Lengkap          ${PINK}│${NC}"
+    echo -e "${PINK}│${NC} ${GREEN}3.${NC}  Rotasi IP WARP                         ${PINK}│${NC}"
+    echo -e "${PINK}│${NC} ${GREEN}4.${NC}  Skala Jumlah Port WARP                 ${PINK}│${NC}"
+    echo -e "${PINK}│${NC} ${GREEN}5.${NC}  Tambah User Proxy (proxy-user)         ${PINK}│${NC}"
+    echo -e "${PINK}│${NC} ${GREEN}6.${NC}  Tambah User VLESS (proxy-vless)        ${PINK}│${NC}"
+    echo -e "${PINK}│${NC} ${CYAN}7.${NC}  Traffic Stats VLESS                    ${PINK}│${NC}"
+    echo -e "${PINK}│${NC} ${CYAN}8.${NC}  Setup Bot Telegram                      ${PINK}│${NC}"
+    echo -e "${PINK}│${NC} ${CYAN}9.${NC}  Export BUNDLE                           ${PINK}│${NC}"
+    echo -e "${PINK}│${NC} ${CYAN}10.${NC} Restart Semua Service                    ${PINK}│${NC}"
+    echo -e "${PINK}│${NC} ${YELLOW}99.${NC} Reset / Uninstall                       ${PINK}│${NC}"
+    echo -e "${PINK}│${NC} ${BLUE}0.${NC}  Keluar                                   ${PINK}│${NC}"
+    echo -e "${PINK}└────────────────────────────────────────────────────────┘${NC}"
+    echo ""
+    read -p "Pilih [0-10/99] > " opt
+    case $opt in
+      1) echo -e "${CYAN}=== VLESS ===${NC}"; cat /root/vless_accounts.txt 2>/dev/null | grep -E 'Link|User'; echo -e "${CYAN}=== PROXY ===${NC}"; cat /root/daftar_proxy.txt 2>/dev/null; echo -e "${CYAN}=== QR (user VLESS pertama) ===${NC}"; first=$(grep -m1 '^Link:' /root/vless_accounts.txt 2>/dev/null | sed 's/^Link: //'); [[ -n "$first" ]] && qrencode -t ansiutf8 "$first" 2>/dev/null || echo "tidak ada";;
+      2) diag;;
+      3) echo -e "${YELLOW}Rotasi WARP...${NC}"; /usr/local/bin/rotate-warp.sh all;;
+      4) scale_ports;;
+      5) read -p "Username: " u; read -p "Password: " p; read -p "Hari: " d; /usr/local/bin/proxy-user add "$u" "$p" "$d";;
+      6) read -p "Username: " u; read -p "Hari: " d; read -p "Outbound [warp/direct] (default warp): " ob; /usr/local/bin/proxy-vless add "$u" "$d" "${ob:-warp}";;
+      7) traffic;;
+      8) setup_bot;;
+      9) export_bundle;;
+      10) systemctl restart xray 3proxy; echo -e "${GREEN}Service direstart${NC}";;
+      99) echo -e "${YELLOW}1) Reset proxies   2) Uninstall total${NC}"; read -p "Pilih: " r; [[ "$r" == "1" ]] && reset_all; [[ "$r" == "2" ]] && uninstall_all;;
+      0) exit 0;;
+      *) echo -e "${RED}Pilihan salah${NC}";;
+    esac
+    echo ""; read -p "Tekan Enter untuk kembali..." _
+  done
+}
+
+[ "$(id -u)" -ne 0 ] && { echo "Harus root"; exit 1; }
+menu

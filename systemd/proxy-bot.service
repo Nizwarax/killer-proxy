@@ -1,0 +1,11 @@
+[Unit]
+Description=KILLER PROXY Telegram Bot
+After=network.target 3proxy.service
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/telegram-bot.py
+Restart=always
+RestartSec=5
+[Install]
+WantedBy=multi-user.target

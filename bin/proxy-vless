@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+"""
+proxy-vless: manage VLESS REALITY users (port 443) with expiry.
+  proxy-vless add <user> <days> [warp|direct] [warp_instance]
+  proxy-vless del <user>
+  proxy-vless list | check
+"""
+import sys, os, json, subprocess, uuid
+from datetime import datetime, timezone, timedelta
+
+VLESS_JSON = "/etc/xray/vless_users.json"
+GEN = "/usr/local/bin/generate-xray.py"
+
+def load():
+    if not os.path.exists(VLESS_JSON):
+        return {"version": "1.0", "users": {}}
+    try:
+        with open(VLESS_JSON) as f:
+            return json.load(f)
+    except Exception:
+        return {"version": "1.0", "users": {}}
+
+def save(data):
+    os.makedirs(os.path.dirname(VLESS_JSON), exist_ok=True)
+    tmp = VLESS_JSON + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, VLESS_JSON)
+
+def regen():
+    subprocess.run([GEN], check=True)
+
+def warp_count():
+    if os.path.isdir("/etc/wireproxy"):
+        try:
+            return len([d for d in os.listdir("/etc/wireproxy") if d.startswith("warp")])
+        except Exception:
+            pass
+    return 4
+
+def add(user, days, ob_type="warp", wi=None):
+    data = load(); users = data.setdefault("users", {})
+    now = datetime.now(timezone.utc); exp = now + timedelta(days=int(days))
+    if wi is None:
+        used = [v.get("warp_instance", 1) for v in users.values() if v.get("outbound", "").startswith("warp")]
+        wi = (len(used) % warp_count()) + 1
+    outbound = f"warp-{wi}" if ob_type == "warp" else "direct"
+    uu = str(uuid.uuid4())
+    if user in users:
+        users[user]["expires_at"] = exp.strftime("%Y-%m-%dT%H:%M:%SZ")
+        users[user]["duration_days"] = int(days)
+        users[user]["status"] = "active"
+        uu = users[user].get("uuid", uu)
+    else:
+        users[user] = {"username": user, "uuid": uu, "email": f"{user}@{outbound}",
+                       "outbound": outbound, "warp_instance": wi if ob_type == "warp" else 0,
+                       "created_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                       "expires_at": exp.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                       "duration_days": int(days), "status": "active"}
+    save(data); regen()
+    print(f"[OK] VLESS '{user}' ({outbound}) added, {days}d, uuid {uu}")
+
+def delete(user):
+    data = load(); users = data.get("users", {})
+    if user not in users:
+        print(f"[ERR] user '{user}' not found"); sys.exit(1)
+    del users[user]; save(data); regen()
+    print(f"[OK] VLESS '{user}' deleted")
+
+def list_users():
+    data = load(); users = data.get("users", {}); now = datetime.now(timezone.utc)
+    if not users:
+        print("No VLESS users yet. Use: proxy-vless add <user> <days>"); return
+    print(f"{'USER':<16}{'STATUS':<9}{'EXPIRES':<12}{'DAYS':<6}{'OUTBOUND':<10}{'UUID'}")
+    print("-" * 82)
+    for u, info in sorted(users.items()):
+        try:
+            d = (datetime.fromisoformat(info["expires_at"].replace("Z", "+00:00")) - now).days
+        except Exception:
+            d = 0
+        st = "EXPIRED" if (d < 0 or info.get("status") == "expired") else ("WARN" if d <= 3 else "ACTIVE")
+        print(f"{u:<16}{st:<9}{info.get('expires_at','')[:10]:<12}{d:<6}{info.get('outbound'):<10}{info.get('uuid')}")
+
+def check():
+    subprocess.run([GEN], check=True)
+    print("[OK] expiry check run")
+
+def usage():
+    print("""Usage: proxy-vless <add <user> <days> [warp|direct] [warp_num]> | del <user> | list | check""")
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2: usage(); sys.exit(1)
+    c = sys.argv[1].lower()
+    if c == "add" and len(sys.argv) >= 4:
+        ob = sys.argv[4] if len(sys.argv) > 4 else "warp"
+        wi = int(sys.argv[5]) if len(sys.argv) > 5 else None
+        add(sys.argv[2], sys.argv[3], ob, wi)
+    elif c in ("del", "delete") and len(sys.argv) == 3: delete(sys.argv[2])
+    elif c == "list": list_users()
+    elif c == "check": check()
+    else: usage(); sys.exit(1)
